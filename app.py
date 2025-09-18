@@ -40,22 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class AppState:
-    """Centralized application state management"""
-    
-    def __init__(self):
-        self.chat_engine = None
-        self.rag_initialized = False
-        self.startup_complete = False
-        self.startup_error = None
-    
-    def is_ready(self) -> bool:
-        """Check if application is ready for use"""
-        return self.startup_complete and self.startup_error is None
-
-
-# Global application state
-app_state = AppState()
+# Application state is now managed through Streamlit session state
 
 
 class ProcessingStatus(Enum):
@@ -69,15 +54,17 @@ class ProcessingStatus(Enum):
     ERROR = "error"
 
 
-def initialize_application() -> bool:
+@st.cache_resource
+def initialize_application() -> tuple:
     """
     Initialize all application components in proper sequence.
+    This function is cached and will only run once per Streamlit session.
     
     Returns:
-        bool: True if initialization successful, False otherwise
+        tuple: (chat_engine, rag_initialized, startup_error)
     """
     try:
-        logger.info("Starting DocQueryAI application initialization...")
+        logger.info("🚀 Starting DocQueryAI application initialization (one-time setup)...")
         
         # Step 1: Initialize vector store
         logger.info("Initializing vector store...")
@@ -89,8 +76,6 @@ def initialize_application() -> bool:
         logger.info("Initializing RAG system...")
         try:
             chat_engine, rag_success = initialize_rag_system()
-            app_state.chat_engine = chat_engine
-            app_state.rag_initialized = rag_success
             
             if rag_success:
                 logger.info("RAG system initialized successfully")
@@ -99,12 +84,12 @@ def initialize_application() -> bool:
                 
         except Exception as e:
             logger.error(f"Failed to initialize RAG system: {str(e)}")
-            app_state.startup_error = f"RAG system initialization failed: {str(e)}"
-            return False
+            startup_error = f"RAG system initialization failed: {str(e)}"
+            return None, False, startup_error
         
         # Step 3: Verify all components are working
         logger.info("Verifying component status...")
-        if app_state.chat_engine and app_state.chat_engine.is_available():
+        if chat_engine and chat_engine.is_available():
             logger.info("✅ LLM service is available")
         else:
             logger.warning("⚠️ LLM service is not available")
@@ -114,15 +99,14 @@ def initialize_application() -> bool:
         else:
             logger.warning("⚠️ Vector store is not initialized")
         
-        app_state.startup_complete = True
         logger.info("🎉 DocQueryAI application initialization complete!")
-        return True
+        return chat_engine, rag_success, None
         
     except Exception as e:
         logger.error(f"Application initialization failed: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        app_state.startup_error = str(e)
-        return False
+        startup_error = str(e)
+        return None, False, startup_error
 
 
 def shutdown_application():
@@ -841,11 +825,11 @@ def process_uploaded_document(uploaded_file):
 
 def create_chat_interface():
     """Create the chat interface for document querying"""
-    if not st.session_state.document_ready:
+    if not st.session_state.get('document_ready', False):
         st.info("📄 Please upload and process a PDF document first to enable chat functionality.")
         return
     
-    if not app_state.chat_engine:
+    if not st.session_state.get('chat_engine'):
         st.error("❌ Chat engine not initialized. Please restart the application.")
         return
     
@@ -876,7 +860,7 @@ def create_chat_interface():
             with st.spinner("Thinking..."):
                 try:
                     # Process query through RAG pipeline
-                    response_data = app_state.chat_engine.process_query(prompt, use_rag=True)
+                    response_data = st.session_state.chat_engine.process_query(prompt, use_rag=True)
                     
                     # Display response
                     st.write(response_data["response"])
@@ -920,12 +904,19 @@ def main():
         # Initialize session state
         initialize_session_state()
         
-        # Initialize application components on first run
-        if not app_state.startup_complete and app_state.startup_error is None:
-            with st.spinner("🚀 Initializing DocQueryAI..."):
-                success = initialize_application()
-                if not success:
-                    st.error(f"❌ Application initialization failed: {app_state.startup_error}")
+        # Initialize application components (cached - only runs once)
+        if 'app_initialized' not in st.session_state:
+            with st.spinner("🚀 Initializing DocQueryAI (one-time setup)..."):
+                chat_engine, rag_initialized, startup_error = initialize_application()
+                
+                # Store in session state
+                st.session_state.chat_engine = chat_engine
+                st.session_state.rag_initialized = rag_initialized
+                st.session_state.startup_error = startup_error
+                st.session_state.app_initialized = True
+                
+                if startup_error:
+                    st.error(f"❌ Application initialization failed: {startup_error}")
                     st.info("""
                     **Troubleshooting Steps:**
                     1. Ensure Ollama is running: `ollama serve`
@@ -940,8 +931,8 @@ def main():
         display_header()
         
         # Show startup error if any
-        if app_state.startup_error:
-            st.error(f"❌ Application Error: {app_state.startup_error}")
+        if st.session_state.get('startup_error'):
+            st.error(f"❌ Application Error: {st.session_state.startup_error}")
             st.stop()
         
         # Display status indicators
@@ -976,7 +967,7 @@ def main():
             st.header("📊 Application Status")
             
             # System status
-            if app_state.chat_engine and app_state.chat_engine.is_available():
+            if st.session_state.get('chat_engine') and st.session_state.chat_engine.is_available():
                 st.success("🤖 LLM: Available")
             else:
                 st.error("🤖 LLM: Not Available")
@@ -987,7 +978,7 @@ def main():
             else:
                 st.error("🗄️ Vector Store: Not Initialized")
             
-            if st.session_state.document_ready:
+            if st.session_state.get('document_ready', False):
                 st.success("📄 Document: Ready")
             else:
                 st.warning("📄 Document: Not Loaded")
@@ -1003,9 +994,10 @@ def main():
                 st.rerun()
             
             if st.button("🔄 Restart Application", use_container_width=True):
-                # Reset application state
-                app_state.startup_complete = False
-                app_state.startup_error = None
+                # Clear cached resources and session state
+                st.cache_resource.clear()
+                for key in list(st.session_state.keys()):
+                    del st.session_state[key]
                 st.success("Application will restart...")
                 st.rerun()
             
